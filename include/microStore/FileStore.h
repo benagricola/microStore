@@ -1289,6 +1289,29 @@ public:
 	{
 printf("[ustore] Compacting storage...\n");
 
+		// Close any open handle on the active segment before we
+		// start unlinking source files. compact() is called from two
+		// places — rotate_segment_if_needed() (which already closes
+		// active_file) and compact_if_threshold() (which does NOT).
+		// Closing here makes the contract uniform: the caller doesn't
+		// need to know which path it came from.
+		//
+		// Without this: on LittleFS the unlink of the current segment
+		// at line "remove(src_name)" below fails with
+		//   "Failed to unlink path /path_store_N.dat. Has open FD."
+		// because active_file still holds an FD on path_store_N.
+		// The compaction's source-segment loop then runs to "success"
+		// without actually freeing any disk space — every threshold-
+		// triggered compaction is a no-op and dead bytes accumulate
+		// until the device runs out of SRAM and the firmware's
+		// low-memory watchdog reboots it.
+		//
+		// The caller is responsible for reopening active_file after
+		// compact() returns (both existing call sites already do this
+		// via open_segment(current_segment)).
+		flush_buffer();
+		if (active_file) active_file.close();
+
 		// --- Phase 1: write COMPACTING journal (next_seg=0: no source segments deleted yet) ---
 		write_journal(JOURNAL_COMPACTING, 0, 0);
 
