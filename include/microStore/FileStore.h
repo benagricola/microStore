@@ -61,7 +61,20 @@ namespace microStore {
 #endif
 
 #ifndef USTORE_COMPACT_THRESHOLD
-#define USTORE_COMPACT_THRESHOLD 25  // % dead records that trigger auto-compact (0 = disabled)
+// % dead records (relative to total live + dead since last compact) that
+// triggers auto-compact. 0 = auto-compact disabled.
+//
+// 80% (was 25%) chosen after the previous compaction fix landed: with
+// 25% the auto-compact path fired on essentially every announce churn
+// pair (2 live + 1 new dead = 33% → compact), and each compact()
+// invocation walks every segment + rebuilds the index synchronously
+// while holding rns_lock. On the firmware this starved AsyncTCP and
+// the radio task, leading to periodic reboots roughly every 60 s of
+// announce traffic. 80% lets dead records breathe — compaction runs
+// only when there are ~4x more dead than live records, which keeps
+// the on-disk footprint reasonable without taking out the system on
+// every announce.
+#define USTORE_COMPACT_THRESHOLD 80
 #endif
 
 #ifndef USTORE_DEFAULT_TTL_SECS
