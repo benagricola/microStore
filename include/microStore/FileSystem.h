@@ -15,6 +15,7 @@
 #pragma once
 
 #include "File.h"
+#include "IoFailure.h"
 
 #include <list>
 #include <vector>
@@ -98,15 +99,44 @@ public:
 	inline void loop() { assert(_impl); _impl->loop(); }
 
 	// Factory
-	inline File open(const char* path, File::Mode mode, const bool create = false) { return _impl->open(path, mode, create); }
+	inline File open(const char* path, File::Mode mode, const bool create = false) {
+		File f = _impl->open(path, mode, create);
+		if (!f) _notify_io_failure(path, IoOp::Open);
+		return f;
+	}
 	//File open(const char *path, const char *mode = "r", const bool create = false);
 
 	// POSIX
-	inline bool exists(const char* path) { assert(_impl); return _impl->exists(path); }
-	inline bool remove(const char* path) { assert(_impl); return _impl->remove(path); }
-	inline bool rename(const char* from_path, const char* to_path) { assert(_impl); return _impl->rename(from_path, to_path); }
-	inline bool mkdir(const char* path) { assert(_impl); return _impl->mkdir(path); }
-	inline bool rmdir(const char* path) { assert(_impl); return _impl->rmdir(path); }
+	inline bool exists(const char* path) {
+		assert(_impl);
+		bool ok = _impl->exists(path);
+		if (!ok) _notify_io_failure(path, IoOp::Exists);
+		return ok;
+	}
+	inline bool remove(const char* path) {
+		assert(_impl);
+		bool ok = _impl->remove(path);
+		if (!ok) _notify_io_failure(path, IoOp::Remove);
+		return ok;
+	}
+	inline bool rename(const char* from_path, const char* to_path) {
+		assert(_impl);
+		bool ok = _impl->rename(from_path, to_path);
+		if (!ok) _notify_io_failure(from_path, IoOp::Rename);
+		return ok;
+	}
+	inline bool mkdir(const char* path) {
+		assert(_impl);
+		bool ok = _impl->mkdir(path);
+		if (!ok) _notify_io_failure(path, IoOp::Mkdir);
+		return ok;
+	}
+	inline bool rmdir(const char* path) {
+		assert(_impl);
+		bool ok = _impl->rmdir(path);
+		if (!ok) _notify_io_failure(path, IoOp::Rmdir);
+		return ok;
+	}
 
 	// Helper
 	inline size_t size(const char* path) { assert(_impl); return _impl->size(path); }
@@ -120,6 +150,7 @@ public:
 		if (!file) return 0;
 		size_t read = file.read(buffer, size);
 		file.close();
+		if (read == 0 && size > 0) _notify_io_failure(path, IoOp::ReadFile);
 		return read;
 	}
 	virtual size_t readFile(const char* path, std::vector<uint8_t>& data) {
@@ -130,6 +161,7 @@ public:
 		size_t read = file.read(data.data(), size);
 		file.close();
 		data.resize(read);
+		if (read == 0 && size > 0) _notify_io_failure(path, IoOp::ReadFile);
 		return read;
 	}
 	virtual size_t writeFile(const char* path, const uint8_t* buffer, size_t len) {
@@ -139,6 +171,7 @@ public:
 		if (!file) return 0;
 		size_t wrote = file.write(buffer, len);
 		file.close();
+		if (wrote < len) _notify_io_failure(path, IoOp::WriteFile);
 		return wrote;
 	}
 	virtual size_t writeFile(const char* path, const std::vector<uint8_t>& data) {
@@ -148,6 +181,7 @@ public:
 		if (!file) return 0;
 		size_t wrote = file.write(data.data(), data.size());
 		file.close();
+		if (wrote < data.size()) _notify_io_failure(path, IoOp::WriteFile);
 		return wrote;
 	}
 

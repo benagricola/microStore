@@ -15,6 +15,7 @@
 #pragma once
 
 #include "Utility.h"
+#include "IoFailure.h"
 
 #ifdef ARDUINO
 #include <Stream.h>
@@ -112,16 +113,39 @@ public:
 		_crc = crc32(_crc, uch);
 		return ch;
 	}
-	inline size_t write(uint8_t byte) { assert(_impl); _crc = crc32(_crc, byte); return _impl->write(byte); }
-	inline size_t read(uint8_t* buffer, size_t size) { assert(_impl); size_t read = _impl->read(buffer, size); if (read > 0 && read != -1) _crc = crc32(_crc, buffer, read); return read; }
+	inline size_t write(uint8_t byte) {
+		assert(_impl);
+		_crc = crc32(_crc, byte);
+		size_t wrote = _impl->write(byte);
+		if (wrote == 0) _notify_io_failure(_impl->name(), IoOp::Write);
+		return wrote;
+	}
+	inline size_t read(uint8_t* buffer, size_t size) {
+		assert(_impl);
+		size_t read = _impl->read(buffer, size);
+		if (read > 0 && read != (size_t)-1) _crc = crc32(_crc, buffer, read);
+		if (read == 0 && size > 0 && _impl->available() > 0) _notify_io_failure(_impl->name(), IoOp::Read);
+		return read;
+	}
 	inline size_t read(void* buffer, size_t size) { return read((uint8_t*)buffer, size); }
-	inline size_t write(const uint8_t* buffer, size_t size) { assert(_impl); _crc = crc32(_crc, buffer, size); return _impl->write(buffer, size); }
+	inline size_t write(const uint8_t* buffer, size_t size) {
+		assert(_impl);
+		_crc = crc32(_crc, buffer, size);
+		size_t wrote = _impl->write(buffer, size);
+		if (wrote < size) _notify_io_failure(_impl->name(), IoOp::Write);
+		return wrote;
+	}
 	inline size_t write(const void* buffer, size_t size) { return write((const uint8_t*)buffer, size); }
 
 	inline int available() { assert(_impl); return _impl->available(); }
 	inline int peek() { assert(_impl); return _impl->peek(); }
 	inline size_t tell() { assert(_impl); return _impl->tell(); }
-	inline long seek(uint32_t pos, SeekMode mode) { assert(_impl); return _impl->seek(pos, mode); }
+	inline long seek(uint32_t pos, SeekMode mode) {
+		assert(_impl);
+		long result = _impl->seek(pos, mode);
+		if (result < 0) _notify_io_failure(_impl->name(), IoOp::Seek);
+		return result;
+	}
 	inline long seek(uint32_t pos) { return seek(pos, SeekModeSet); }
 	inline void flush() { assert(_impl); _impl->flush(); }
 
