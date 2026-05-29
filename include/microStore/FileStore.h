@@ -1139,12 +1139,29 @@ printf("[ustore] Rotating segment...\n");
 #if USTORE_COMPACT_THRESHOLD > 0
 		uint32_t total = (uint32_t)_index.size() + _dead_since_compact;
 		if (total > 0 && _dead_since_compact * 100 / total >= USTORE_COMPACT_THRESHOLD) {
-printf("[ustore] Compaction triggered by deleted threshold\n");
+			// Respect the same back-off the rotate path uses, so a failing
+			// compact() isn't retried on every put(). active_file stays open
+			// on this path (compact() is never entered), so the store keeps
+			// working.
+			if (compact_in_cooldown &&
+				(microStore::millis() - compact_cooldown_start_ms) < USTORE_COMPACT_RETRY_MS)
+			{
+				return;
+			}
+			printf("[ustore] Compaction triggered by deleted threshold\n");
 			if (compact()) {
-				// After threshold-triggered compaction, seg0 holds the compacted data.
-				// Open seg1 for new writes, mirroring what rotate_segment_if_needed() does
-				// after a rotation-triggered compaction.
+				// seg0 now holds the compacted data; fresh writes start at
+				// seg1, mirroring rotate_segment_if_needed().
+				compact_in_cooldown = false;
 				current_segment = 1;
+				open_segment(current_segment);
+			} else {
+				// compact() closed active_file at its top and then failed.
+				// Without reopening, the next flush_buffer() sees !active_file
+				// and silently drops the write. Restore the open-active-file
+				// invariant and back off, exactly as the rotate path does.
+				compact_in_cooldown       = true;
+				compact_cooldown_start_ms = microStore::millis();
 				open_segment(current_segment);
 			}
 		}
