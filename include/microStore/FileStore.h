@@ -1394,6 +1394,7 @@ USTORE_LOG("[ustore] Opening tmp file: %s\n", tmp_name);
 		uint32_t committed_segs = 0;  // number of source segments committed to compact.tmp
 
 		for (uint32_t s = 0; s < _segment_count; s++) {
+			yield_now();   // cooperative yield between segments (feed host WDT)
 			offsets.clear();
 			for (auto& kv : _index) {
 				if (kv.second.segment != s) continue;
@@ -1409,6 +1410,7 @@ USTORE_LOG("[ustore] Opening src file: %s\n", src_name);
 				File src = _filesystem.open(src_name, File::ModeRead);
 				if (src) {
 					for (size_t i = 0; i < offsets.size(); i++) {
+						yield_now();   // feed host WDT during the per-record copy
 						uint32_t off = offsets[i];
 USTORE_LOG("[ustore] Processing record: %u offset: %lu\n", (unsigned)i, (unsigned long)off);
 						src.seek((long)off, SeekModeSet);
