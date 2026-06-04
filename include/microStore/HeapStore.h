@@ -88,8 +88,19 @@ public:
         }
 
         if (policy_max_recs > 0 && data_.count(k) == 0) {
-            while (data_.size() >= policy_max_recs)
-                data_.erase(data_.begin());
+            while (data_.size() >= policy_max_recs) {
+                // Evict the least-recently-stored entry (oldest timestamp), NOT
+                // the lowest-key one (data_.begin()). Key-ordered eviction drops
+                // a frequently-refreshed record — e.g. a peer announcing every
+                // 20s — ahead of stale ones the moment its key becomes lowest,
+                // so its path keeps vanishing under churn at the cap. LRU keeps
+                // active destinations resident. (FileStore already evicted by
+                // timestamp; this restores parity after the PSRAM switch.)
+                auto oldest = data_.begin();
+                for (auto it = data_.begin(); it != data_.end(); ++it)
+                    if (it->second.timestamp < oldest->second.timestamp) oldest = it;
+                data_.erase(oldest);
+            }
         }
 
         HeapEntry& e = data_[k];
