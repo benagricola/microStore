@@ -219,11 +219,23 @@ protected:
 		}
 
 		inline virtual size_t storageSize() override {
-			return LittleFS.totalBytes();
+			// The flash partition size is constant, but LittleFS.totalBytes()
+			// routes through esp_littlefs_info(), which runs a full lfs_fs_size()
+			// block scan (multi-second on a populated partition). Cache the
+			// one-time result so repeated/periodic callers don't rescan.
+			static size_t cached = 0;
+			if (cached == 0) {
+				cached = LittleFS.totalBytes();
+			}
+			return cached;
 		}
 
 		inline virtual size_t storageAvailable() override {
-			return (LittleFS.totalBytes() - LittleFS.usedBytes());
+			// Only usedBytes() needs the live scan; reuse the cached total rather
+			// than paying totalBytes()'s scan a second time.
+			const size_t total = storageSize();
+			const size_t used  = LittleFS.usedBytes();
+			return (total > used) ? (total - used) : 0;
 		}
 
 	};
