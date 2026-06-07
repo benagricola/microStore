@@ -92,6 +92,15 @@ namespace microStore {
 #define USTORE_DEFAULT_TTL_SECS 0
 #endif
 
+// Records copied per incremental compaction slice (one compact_step pump). Each
+// slice runs under the caller's lock, so this bounds the per-step stall; the
+// lock is released between slices, letting the radio/main loop run. Smaller =
+// shorter stalls but more pumps (and a larger TieredStore write buffer) to drain
+// a compaction. Only used when set_incremental(true).
+#ifndef USTORE_COMPACT_STEP_RECORDS
+#define USTORE_COMPACT_STEP_RECORDS 16
+#endif
+
 #ifndef USTORE_DEFAULT_MAX_RECS
 #define USTORE_DEFAULT_MAX_RECS 0
 #endif
@@ -247,10 +256,12 @@ public:
 
 		if (key_len > USTORE_MAX_KEY_LEN) {
 			USTORE_LOG("[ustore] put: failed due to excessive key length: %u\n", key_len);
+			_stat_put_fails++;
 			return false;
 		}
 		if (len > USTORE_MAX_VALUE_LEN) {
 			USTORE_LOG("[ustore] put: failed due to excessive data length: %u\n", len);
+			_stat_put_fails++;
 			return false;
 		}
 
@@ -286,6 +297,7 @@ public:
 		// ensure data is on flash before committing index entry
 		// if flush fails then fail put without writing index entry
 		if (!flush_buffer()) {
+			_stat_put_fails++;
 			return false;
 		}
 
@@ -569,6 +581,7 @@ USTORE_LOG("[ustore] get: returning key %s with data length %u\n", bin_str(key, 
 		uint64_t bytes_written;   // payload bytes appended by put()
 		uint32_t live_recs;       // current live record count (index size)
 		uint32_t dead_since_compact;  // dead records accrued since last compaction
+		uint32_t put_fails;       // put() calls that returned false (size/flush rejects)
 	};
 	inline Stats stats()
 	{
@@ -579,6 +592,7 @@ USTORE_LOG("[ustore] get: returning key %s with data length %u\n", bin_str(key, 
 		s.bytes_written      = _stat_bytes;
 		s.live_recs          = (uint32_t)(isValid() ? _index.size() : 0);
 		s.dead_since_compact = _dead_since_compact;
+		s.put_fails          = _stat_put_fails;
 		return s;
 	}
 
@@ -818,7 +832,19 @@ public:
 
 			f.seek((long)iv_.offset, SeekModeSet);
 			RecordHeader hdr;
-			f.read(&hdr, sizeof(hdr));
+			// Defensive: a stale/corrupt index entry can point at a non-record
+			// offset (e.g. after an interrupted compaction). Reject anything that
+			// isn't a sane record header BEFORE resize(hdr.length) — otherwise a
+			// garbage length triggers a multi-megabyte allocation / OOM crash on
+			// the warm-load that iterates the whole store.
+			if (f.read(&hdr, sizeof(hdr)) != sizeof(hdr) ||
+			    hdr.magic != MAGIC_RECORD ||
+			    hdr.key_len > USTORE_MAX_KEY_LEN ||
+			    hdr.length  > USTORE_MAX_VALUE_LEN) {
+				current_.value.clear();
+				f.close();
+				return;
+			}
 			f.seek((long)(iv_.offset + sizeof(hdr) + hdr.key_len), SeekModeSet);
 			current_.value.resize(hdr.length);
 			if (hdr.length > 0)
@@ -1187,6 +1213,15 @@ USTORE_LOG("[ustore] Rotating segment...\n");
 				return;
 			}
 			USTORE_LOG("[ustore] Compaction triggered by deleted threshold\n");
+			if (_incremental) {
+				// Begin a resumable compaction and return — the host pumps
+				// compact_step() between loop ticks while the front tier absorbs
+				// reads and buffers writes. compact_begin() closes the active
+				// segment; compact_finalize()/compact_abort() reopen one. Avoiding
+				// the synchronous O(records) freeze here is the entire point.
+				if (!compacting()) compact_begin();
+				return;
+			}
 			if (compact()) {
 				// seg0 now holds the compacted data; fresh writes start at
 				// seg1, mirroring rotate_segment_if_needed().
@@ -1237,15 +1272,30 @@ USTORE_LOG("[ustore] Rotating segment...\n");
 			// or a partial write stopped by the crash — both are handled harmlessly by the
 			// segment scan in rebuild_index_from_segments()).
 			//
-			// Recovery strategy: rename compact.tmp → segment_0.dat so that the normal
-			// boot index rebuild picks it up alongside the surviving segments next_seg..7.
-			// The next compaction cycle will consolidate everything correctly.
+			// Recovery strategy: consolidate compact.tmp into segment_0.dat so the
+			// surviving segments next_seg..7 plus seg0 hold every live record, then
+			// force a full index rebuild from those segments.
+			//
+			// The on-disk index still maps every key to its PRE-compaction
+			// segment/offset, which is now stale (seg0 is the compacted data) and
+			// would make the boot warm-load read garbage. Drop it UNCONDITIONALLY
+			// — before the rename — so the index is never trusted across an
+			// interrupted compaction, even on a retry where tmp was already renamed
+			// by an earlier boot.
+			char iname[USTORE_MAX_FILENAME_LEN]; index_name(iname);
+			_filesystem.remove(iname);
+
 			char seg0[USTORE_MAX_FILENAME_LEN]; segment_name(0, seg0);
-			if (!_filesystem.rename(tmp_name, seg0)) {
-				// Rename failed (e.g. filesystem error). Best effort: leave compact.tmp
-				// in place; the next boot will retry this same recovery path.
-				return;  // keep journal so next boot retries
+			if (_filesystem.exists(tmp_name)) {
+				if (!_filesystem.rename(tmp_name, seg0)) {
+					// Genuine filesystem error — keep the journal and retry next
+					// boot. The index is already gone, so this boot still rebuilds
+					// (minus the un-renamed tmp records, recovered on the retry).
+					return;
+				}
 			}
+			// else: a previous boot already renamed tmp→seg0 — nothing left to
+			// consolidate; just clear the journal below.
 		}
 
 		_filesystem.remove(name);  // clear journal
@@ -1304,6 +1354,218 @@ USTORE_LOG("[ustore] Rotating segment...\n");
 		// current_offset is set by open_segment() which the caller will invoke next.
 	}
 
+	/* -------- INCREMENTAL (RESUMABLE) COMPACTION ENGINE -------- */
+
+	// Begin a compaction: close the active segment, journal COMPACTING, open
+	// compact.tmp, evict to max_recs, and seed the step cursors. Afterwards there
+	// is NO open active segment — compact_step() must run to a finalize or abort,
+	// both of which reopen one. On a tmp-open failure the store stays writable.
+	void compact_begin()
+	{
+USTORE_LOG("[ustore] Compacting storage (begin)...\n");
+		// Close any open handle on the active segment before unlinking source
+		// files. Without this, LittleFS refuses to unlink the current segment
+		// ("Has open FD") and every compaction silently frees nothing — dead
+		// bytes then accumulate until the low-memory watchdog reboots the device.
+		flush_buffer();
+		if (active_file) active_file.close();
+
+		_compacting         = true;
+		_compact_failed     = false;
+		_compact_dirty      = false;
+		_compact_seg        = 0;
+		_compact_rec        = 0;
+		_compact_out_off    = 0;
+		_compact_committed  = 0;
+		_compact_seg_loaded = false;
+		_compact_offsets.clear();
+
+		// Phase 1: journal COMPACTING (next_seg=0 — no source segments deleted yet).
+		write_journal(JOURNAL_COMPACTING, 0, 0);
+
+		char tmp_name[USTORE_MAX_FILENAME_LEN]; snprintf(tmp_name, sizeof(tmp_name), "%s_compact.tmp", base_prefix);
+USTORE_LOG("[ustore] Opening tmp file: %s\n", tmp_name);
+		_compact_outf = _filesystem.open(tmp_name, File::ModeWrite);
+		if (!_compact_outf) {
+			// Can't open the scratch file — abort cleanly and stay writable.
+			clear_journal();
+			_compact_failed = true;
+			_compacting     = false;
+			open_segment(current_segment);
+			return;
+		}
+
+		// Evict excess (max_recs) before enumerating live records, so over-cap
+		// entries are dropped from the compacted output.
+		prune_index_to_max_recs_();
+	}
+
+	// Snapshot the live record offsets of the current source segment from the
+	// in-memory index (sorted for sequential reads) and open it for reading.
+	// TTL-expired entries are dropped from the index here rather than copied — so
+	// their stale segment/offset cannot survive into the compacted store.
+	void compact_load_segment()
+	{
+		_compact_offsets.clear();
+		using KeyVec = std::vector<KeyType, rebind_alloc<KeyType>>;
+		KeyVec expired{ rebind_alloc<KeyType>(_alloc) };
+		for (auto& kv : _index) {
+			if (kv.second.segment != _compact_seg) continue;
+			if (is_ttl_expired_(kv.second.timestamp, kv.second.ttl)) { expired.push_back(kv.first); continue; }
+			_compact_offsets.push_back(kv.second.offset);
+		}
+		for (auto& k : expired) _index.erase(k);   // safe: iteration finished
+		std::sort(_compact_offsets.begin(), _compact_offsets.end());
+
+		char src_name[USTORE_MAX_FILENAME_LEN]; segment_name(_compact_seg, src_name);
+		_compact_src        = _filesystem.open(src_name, File::ModeRead);  // may be invalid (empty/missing segment)
+		_compact_rec        = 0;
+		_compact_seg_loaded = true;
+	}
+
+	// Copy one live record from the source segment into compact.tmp and repoint
+	// its index entry at the new (segment 0) offset — building the post-compaction
+	// index inline, so finalize is a rename + index-write with no O(records)
+	// re-scan. Returns false only on a fatal write error (out of space), which
+	// aborts the compaction. A corrupt/unreadable source record is skipped and
+	// flags _compact_dirty, forcing finalize to fall back to the authoritative
+	// re-scan so no stale index entry survives.
+	bool compact_copy_one()
+	{
+		// Static scratch (compact is not re-entrant) — keep 1 KB off the stack.
+		static uint8_t key_buf[USTORE_MAX_KEY_LEN];
+		static uint8_t val_buf[USTORE_MAX_VALUE_LEN];
+
+		uint32_t off = _compact_offsets[_compact_rec++];
+		yield_now();
+		if (!_compact_src) { _compact_dirty = true; return true; }
+
+		_compact_src.seek((long)off, SeekModeSet);
+		RecordHeader hdr;
+		if (_compact_src.read(&hdr, sizeof(hdr)) != sizeof(hdr) ||
+			hdr.magic != MAGIC_RECORD || hdr.key_len > USTORE_MAX_KEY_LEN || hdr.length > USTORE_MAX_VALUE_LEN) {
+			_compact_dirty = true; return true;
+		}
+		if (_compact_src.read(key_buf, hdr.key_len) != hdr.key_len) { _compact_dirty = true; return true; }
+		if (hdr.length > 0 && _compact_src.read(val_buf, hdr.length) != hdr.length) { _compact_dirty = true; return true; }
+
+		RecordCommit c; c.magic = MAGIC_COMMIT;
+		uint32_t reclen  = sizeof(hdr) + hdr.key_len + hdr.length + sizeof(c);
+		size_t   written = 0;
+		written += _compact_outf.write(&hdr,    sizeof(hdr));
+		written += _compact_outf.write(key_buf, hdr.key_len);
+		if (hdr.length > 0) written += _compact_outf.write(val_buf, hdr.length);
+		written += _compact_outf.write(&c, sizeof(c));
+		if (written != reclen) return false;   // out of space — abort
+
+		// Inline index build: repoint this key at its new home in seg0.
+		IndexValue* iv = index_find(key_buf, hdr.key_len);
+		if (iv) { iv->segment = 0; iv->offset = _compact_out_off; }
+		else    { _compact_dirty = true; }   // key vanished mid-compaction — be safe
+		_compact_out_off += reclen;
+		return true;
+	}
+
+	// Done with the current source segment: flush compact.tmp, journal progress
+	// (next_seg = seg+1) BEFORE deleting the source (crash-safe ordering — a crash
+	// between the two is reconciled on boot), delete the source, advance.
+	bool compact_close_segment()
+	{
+		if (_compact_src) _compact_src.close();
+		_compact_outf.flush();
+
+		write_journal(JOURNAL_COMPACTING, _compact_seg + 1, _compact_out_off);
+
+		char src_name[USTORE_MAX_FILENAME_LEN]; segment_name(_compact_seg, src_name);
+		_filesystem.remove(src_name);   // no-op if the segment had no records / didn't exist
+		_compact_committed++;
+
+		_compact_seg++;
+		_compact_seg_loaded = false;
+		return true;
+	}
+
+	// All source segments copied: commit, swap compact.tmp into seg0, persist the
+	// index, and reopen a writable active segment (seg1 — seg0 holds compacted
+	// data, mirroring rotate_segment_if_needed()).
+	void compact_finalize()
+	{
+		_compact_outf.flush();
+		_compact_outf.close();
+
+		// Phase 4: commit — past this point recover_if_needed() finalizes on boot.
+		write_journal(JOURNAL_COMMIT);
+
+		if (_compact_dirty) {
+			// A record was skipped (corruption) — the inline index can't be
+			// trusted. Fall back to the authoritative rename + full seg0 re-scan.
+			finalize_compaction();
+		} else {
+			// Fast path: the index already points every live key at its seg0
+			// offset. Swap the file in and persist the in-memory index as-is —
+			// no O(records) re-scan.
+			char tmp_name[USTORE_MAX_FILENAME_LEN]; snprintf(tmp_name, sizeof(tmp_name), "%s_compact.tmp", base_prefix);
+			char seg0[USTORE_MAX_FILENAME_LEN];     segment_name(0, seg0);
+			for (uint32_t i = 0; i < _segment_count; i++) {
+				char sname[USTORE_MAX_FILENAME_LEN]; segment_name(i, sname);
+				_filesystem.remove(sname);
+			}
+			if (_filesystem.rename(tmp_name, seg0)) {
+				char iname[USTORE_MAX_FILENAME_LEN]; index_name(iname);
+				if (index_file) index_file.close();
+				_filesystem.remove(iname);
+				write_index_bulk();
+				open_index_for_append();
+			} else {
+				// Rename failed — recover by re-scan (the index may now be stale).
+				_filesystem.remove(tmp_name);
+				finalize_compaction();
+			}
+		}
+
+		clear_journal();
+		_dead_since_compact = 0;
+		_stat_compacts++;
+		_compacting     = false;
+		compact_in_cooldown = false;
+
+		current_segment = 1;
+		open_segment(1);
+	}
+
+	// Abort an in-flight compaction (write error / open failure). Preserve data
+	// per the journal protocol and reopen a writable active segment.
+	void compact_abort()
+	{
+		if (_compact_src)  _compact_src.close();
+		if (_compact_outf) _compact_outf.close();
+
+		char tmp_name[USTORE_MAX_FILENAME_LEN]; snprintf(tmp_name, sizeof(tmp_name), "%s_compact.tmp", base_prefix);
+		if (_compact_committed == 0) {
+			// No source segment deleted yet — discard the scratch file entirely.
+			_filesystem.remove(tmp_name);
+			clear_journal();
+		}
+		// else: source segments 0.._compact_committed-1 are gone and live only in
+		// compact.tmp; leave compact.tmp + the journal so recover_if_needed()
+		// finishes the swap on the next boot.
+
+		_compact_failed     = true;
+		_compacting         = false;
+		// Back off so a failing compaction isn't retried on every put().
+		compact_in_cooldown       = true;
+		compact_cooldown_start_ms = microStore::millis();
+
+		// The in-memory index now mixes repointed (seg0) and not-yet-processed
+		// entries; rebuild it from what is actually on disk so reads stay correct
+		// until the boot-time recovery consolidates compact.tmp.
+		if (_compact_committed > 0)
+			rebuild_index_from_segments();
+
+		current_segment = _segment_count - 1;
+		open_segment(current_segment);
+	}
+
 	/* -------- INDEX REBUILD FROM LOG -------- */
 
 	// Called when the index file is missing. Scans all segment files in write
@@ -1353,169 +1615,53 @@ USTORE_LOG("[ustore] Rotating segment...\n");
 	/* -------- COMPACTION -------- */
 
 public:
+	// Synchronous compaction: begin a resumable compaction (if one is not already
+	// in flight) and drain it to completion in this call. The work itself lives in
+	// the resumable engine (compact_begin + compact_step + compact_finalize);
+	// passing SIZE_MAX runs every slice back-to-back without yielding the caller.
+	// This is the path standalone FileStores and the segments-full rotate take.
+	// The incremental path (set_incremental(true)) instead begins the compaction
+	// and lets the host drive compact_step() a few records at a time between loop
+	// ticks, so the old single ~O(records) freeze is sliced into bounded steps.
 	bool compact()
 	{
-USTORE_LOG("[ustore] Compacting storage...\n");
+		if (!_compacting) compact_begin();
+		while (!compact_step(SIZE_MAX)) { /* drain */ }
+		return !_compact_failed;
+	}
 
-		// Close any open handle on the active segment before we
-		// start unlinking source files. compact() is called from two
-		// places — rotate_segment_if_needed() (which already closes
-		// active_file) and compact_if_threshold() (which does NOT).
-		// Closing here makes the contract uniform: the caller doesn't
-		// need to know which path it came from.
-		//
-		// Without this: on LittleFS the unlink of the current segment
-		// at line "remove(src_name)" below fails with
-		//   "Failed to unlink path /path_store_N.dat. Has open FD."
-		// because active_file still holds an FD on path_store_N.
-		// The compaction's source-segment loop then runs to "success"
-		// without actually freeing any disk space — every threshold-
-		// triggered compaction is a no-op and dead bytes accumulate
-		// until the device runs out of SRAM and the firmware's
-		// low-memory watchdog reboots it.
-		//
-		// The caller is responsible for reopening active_file after
-		// compact() returns (both existing call sites already do this
-		// via open_segment(current_segment)).
-		flush_buffer();
-		if (active_file) active_file.close();
+	// Opt this store into incremental compaction: compact_if_threshold() begins a
+	// resumable compaction and returns instead of draining, leaving the host to
+	// pump compact_step(). Only safe when a front tier (e.g. BasicTieredStore)
+	// absorbs reads and buffers writes while the active segment is closed.
+	inline void set_incremental(bool enabled) { _incremental = enabled; }
 
-		// --- Phase 1: write COMPACTING journal (next_seg=0: no source segments deleted yet) ---
-		write_journal(JOURNAL_COMPACTING, 0, 0);
+	// Is a resumable compaction in flight (spanning multiple compact_step calls)?
+	inline bool compacting() const { return _compacting; }
 
-		char tmp_name[USTORE_MAX_FILENAME_LEN]; snprintf(tmp_name, sizeof(tmp_name), "%s_compact.tmp", base_prefix);
-USTORE_LOG("[ustore] Opening tmp file: %s\n", tmp_name);
-		File outf = _filesystem.open(tmp_name, File::ModeWrite);
-		if (!outf) { clear_journal(); return false; }
-
-		// --- Phase 2 + 3 fused: stream live offsets one segment at a time ---
-		// For each segment s:
-		//   1. Walk _index to collect live offsets in segment s into a single
-		//      reusable vector (clear() retains capacity across iterations).
-		//   2. Sort by offset for sequential disk access.
-		//   3. Copy live records from s to compact.tmp.
-		//   4. Flush compact.tmp to disk.
-		//   5. Write journal (next_seg=s+1, tmp_valid_size=current byte count).
-		//   6. Delete source segment s.
-		// Steps 5 and 6 MUST be in this order: the journal is updated BEFORE the source
-		// segment is deleted. If power fails between step 5 and step 6, the next boot's
-		// recover_if_needed() sees next_seg=s+1 and renames compact.tmp to segment 0, then
-		// finalize_compaction() deletes the still-present segment s — no data is lost.
-		//
-		// _index must not be inserted into or erased from between here and Phase 4
-		// (prune_index_to_max_recs_ runs before, finalize_compaction runs after) so
-		// the per-segment re-iteration is stable.
-
-		// Apply policies before enumerating live records so that expired and excess
-		// records are excluded from the compaction output.
-		prune_index_to_max_recs_();
-
-		using OffVec = std::vector<uint32_t, rebind_alloc<uint32_t>>;
-		rebind_alloc<uint32_t> off_alloc(_alloc);
-		OffVec offsets(off_alloc);
-
-		// Static to avoid placing 1 KB on the stack — compact() is not re-entrant.
-		uint8_t key_buf[USTORE_MAX_KEY_LEN];
-		static uint8_t val_buf[USTORE_MAX_VALUE_LEN];
-		bool write_ok = true;
-		uint32_t committed_segs = 0;  // number of source segments committed to compact.tmp
-
-		for (uint32_t s = 0; s < _segment_count; s++) {
-			yield_now();   // cooperative yield between segments (feed host WDT)
-			offsets.clear();
-			for (auto& kv : _index) {
-				if (kv.second.segment != s) continue;
-				if (is_ttl_expired_(kv.second.timestamp, kv.second.ttl)) continue;
-				offsets.push_back(kv.second.offset);
+	// Advance an in-flight compaction by up to `max_records` record copies.
+	// Returns true when the store is no longer compacting (finished, aborted,
+	// or was already idle). Drive this from a cooperative loop — releasing the
+	// caller's lock between calls — to slice the old single ~O(records) freeze
+	// into bounded steps. Passing SIZE_MAX runs it to completion in one call.
+	bool compact_step(size_t max_records)
+	{
+		if (!_compacting) return true;
+		size_t done = 0;
+		while (done < max_records) {
+			yield_now();
+			if (!_compact_seg_loaded) {
+				if (_compact_seg >= _segment_count) { compact_finalize(); return true; }
+				compact_load_segment();
 			}
-			std::sort(offsets.begin(), offsets.end());
-
-USTORE_LOG("[ustore] Processing segment: %u, size: %lu\n", s, (unsigned long)offsets.size());
-			char src_name[USTORE_MAX_FILENAME_LEN]; segment_name(s, src_name);
-			if (!offsets.empty()) {
-USTORE_LOG("[ustore] Opening src file: %s\n", src_name);
-				File src = _filesystem.open(src_name, File::ModeRead);
-				if (src) {
-					for (size_t i = 0; i < offsets.size(); i++) {
-						yield_now();   // feed host WDT during the per-record copy
-						uint32_t off = offsets[i];
-USTORE_LOG("[ustore] Processing record: %u offset: %lu\n", (unsigned)i, (unsigned long)off);
-						src.seek((long)off, SeekModeSet);
-						RecordHeader hdr;
-						if (src.read(&hdr, sizeof(hdr)) != sizeof(hdr)) {
-USTORE_LOG("[ustore] WARNING: Failed to read record header\n");
-							continue;
-						}
-						if (hdr.magic != MAGIC_RECORD || hdr.key_len > USTORE_MAX_KEY_LEN || hdr.length > USTORE_MAX_VALUE_LEN) {
-USTORE_LOG("[ustore] WARNING: Record magic number incorrect\n");
-							continue;
-						}
-						if (src.read(key_buf, hdr.key_len) != hdr.key_len) {
-USTORE_LOG("[ustore] WARNING: Failed to read record key\n");
-							continue;
-						}
-						if (hdr.length > 0 && src.read(val_buf, hdr.length) != hdr.length) {
-USTORE_LOG("[ustore] WARNING: Failed to read record value\n");
-							continue;
-						}
-						RecordCommit c; c.magic = MAGIC_COMMIT;
-						uint32_t expected = sizeof(hdr) + hdr.key_len + hdr.length + sizeof(c);
-						size_t written = 0;
-						written += outf.write(&hdr,    sizeof(hdr));
-						written += outf.write(key_buf, hdr.key_len);
-						if (hdr.length > 0) written += outf.write(val_buf, hdr.length);
-						written += outf.write(&c, sizeof(c));
-						if (written != expected) { write_ok = false; break; }
-					}
-USTORE_LOG("[ustore] Closing src file: %s\n", src_name);
-					src.close();
-				}
-				else {
-					USTORE_LOG("[ustore] ERROR: Failed to open src file: %s\n", src_name);
-				}
+			if (_compact_rec >= _compact_offsets.size()) {
+				if (!compact_close_segment()) { compact_abort(); return true; }
+				continue;
 			}
-
-			if (!write_ok) break;
-
-			// Flush compact.tmp, journal BEFORE deleting the source segment (see comment above).
-			outf.flush();
-			uint32_t valid_size = (uint32_t)outf.tell();
-			write_journal(JOURNAL_COMPACTING, s + 1, valid_size);
-			_filesystem.remove(src_name);  // no-op if segment had no records / did not exist
-			committed_segs++;
+			if (!compact_copy_one()) { compact_abort(); return true; }
+			done++;
 		}
-
-		outf.flush();
-USTORE_LOG("[ustore] Closing tmp file: %s\n", tmp_name);
-		outf.close();
-
-		if (!write_ok) {
-			if (committed_segs == 0) {
-				// No source segments were deleted — safe to discard compact.tmp entirely.
-				USTORE_LOG("[ustore] Compact aborted: storage full, all segments preserved\n");
-				_filesystem.remove(tmp_name);
-				clear_journal();
-			} else {
-				// Some source segments were already deleted; compact.tmp holds their records.
-				// Leave compact.tmp and the journal in place. recover_if_needed() on the
-				// next boot will rename compact.tmp to segment 0 and recover cleanly.
-				USTORE_LOG("[ustore] Compact aborted mid-way after %u segments: recovery on next boot\n",
-				       committed_segs);
-			}
-			return false;
-		}
-
-		// --- Phase 4: commit journal → safe to finalize ---
-		write_journal(JOURNAL_COMMIT);
-
-		finalize_compaction();   // rename + index rebuild
-
-		clear_journal();
-
-		_dead_since_compact = 0;
-		_stat_compacts++;
-
-		return true;
+		return false;   // more to do
 	}
 
 private:
@@ -1536,6 +1682,28 @@ private:
 	uint32_t compact_cooldown_start_ms = 0;
 	uint32_t _dead_since_compact = 0;
 
+	// ---- Incremental (resumable) compaction state ----
+	// When _compacting is set, a compaction is in flight across multiple
+	// compact_step() calls. Each step copies a bounded number of live records
+	// from the source segments into compact.tmp, building _compact_index inline
+	// (so finalize is a rename + index-swap, with no O(records) re-scan).
+	// Between steps the caller releases its lock, so the radio/main loop run —
+	// turning the old single ~18 s freeze into many sub-second slices.
+	// The on-disk protocol (per-segment journal + delete) is unchanged, so
+	// recover_if_needed() still recovers a partially-compacted store on boot.
+	bool     _incremental         = false; // begin-and-yield (host pumps compact_step) vs synchronous drain
+	bool     _compacting          = false;
+	uint32_t _compact_seg         = 0;   // source segment currently being copied
+	size_t   _compact_rec         = 0;   // next record index within _compact_offsets
+	File     _compact_outf;              // compact.tmp, held open across steps
+	uint32_t _compact_out_off     = 0;   // write cursor within compact.tmp
+	bool     _compact_seg_loaded  = false;
+	File     _compact_src;               // current source-segment read handle, held across steps
+	uint32_t _compact_committed   = 0;   // source segments committed to compact.tmp so far
+	bool     _compact_failed      = false;
+	bool     _compact_dirty       = false; // a record was skipped — finalize must re-scan, not trust the inline index
+	std::vector<uint32_t> _compact_offsets;  // live offsets of the current source segment
+
 	uint32_t policy_ttl_secs = USTORE_DEFAULT_TTL_SECS; // 0 = TTL disabled (seconds)
 	uint32_t policy_max_recs = USTORE_DEFAULT_MAX_RECS; // 0 = max-records disabled
 
@@ -1543,10 +1711,11 @@ private:
 	// frequency). Cheap to maintain; read via the stats() accessors. Not
 	// persisted — they reset to 0 on each boot, which is what we want for
 	// rate sampling (delta over a window / since-boot).
-	uint32_t _stat_puts     = 0;   // successful put() calls
-	uint32_t _stat_removes  = 0;   // successful remove() calls
-	uint32_t _stat_compacts = 0;   // completed compactions
-	uint64_t _stat_bytes    = 0;   // payload bytes appended by put()
+	uint32_t _stat_puts      = 0;   // successful put() calls
+	uint32_t _stat_removes   = 0;   // successful remove() calls
+	uint32_t _stat_compacts  = 0;   // completed compactions
+	uint64_t _stat_bytes     = 0;   // payload bytes appended by put()
+	uint32_t _stat_put_fails = 0;   // put() calls that returned false
 
 	uint8_t write_buf[USTORE_WRITE_BUFFER_SIZE];
 	size_t write_buf_pos;

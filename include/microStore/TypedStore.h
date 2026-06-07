@@ -44,6 +44,18 @@ public:
         return store.put(k, v, ttl);
     }
 
+    // Front-only put — forwarded to a tiered backing store's put_front() so a
+    // volatile touch (TTL / last-used refresh) updates the RAM front without
+    // hitting the durable tier. Requires the backing Store to provide
+    // put_front() (e.g. BasicTieredStore); not for plain single-tier stores.
+    bool put_front(const Key& key, const Value& value, uint32_t ttl = 0)
+    {
+        if (!isValid()) return false;
+        auto k = KeyCodec::encode(key);
+        auto v = ValueCodec::encode(value);
+        return store.put_front(k, v, ttl);
+    }
+
     bool get(const Key& key, Value& value)
     {
         if (!isValid()) return false;

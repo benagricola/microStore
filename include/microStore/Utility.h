@@ -25,6 +25,27 @@
 
 namespace microStore {
 
+/* ---------------- COOPERATIVE-YIELD HOOK ---------------- */
+
+// Invoked periodically from long blocking operations (compaction record copy,
+// boot-time index rebuild). Lets the host feed a task watchdog and/or yield to
+// other tasks so a large operation cannot trip a watchdog reboot. No-op until
+// set. A plain function pointer (not std::function) keeps this allocation-free
+// and header-only; microStore stays platform-agnostic while the host wires in
+// esp_task_wdt_reset() / yield() / etc. Defined for all platforms (the native
+// host test build instantiates compact(), which calls yield_now()).
+inline void (*&yield_hook())() {
+	static void (*g_yield_hook)() = nullptr;
+	return g_yield_hook;
+}
+inline void set_yield_callback(void (*cb)()) {
+	yield_hook() = cb;
+}
+inline void yield_now() {
+	auto h = yield_hook();
+	if (h) h();
+}
+
 /* ---------------- TIME HELPER ---------------- */
 
 #ifdef ARDUINO
@@ -48,23 +69,6 @@ inline void set_time_offset(uint32_t offset) {
 	time_offset() = offset;
 }
 
-// Cooperative-yield hook, invoked periodically from long blocking operations
-// (compaction record copy, boot-time index rebuild). Lets the host feed a task
-// watchdog and/or yield to other tasks so a large compaction cannot trip a
-// watchdog reboot. No-op until set. A plain function pointer (not std::function)
-// keeps this allocation-free and header-only; microStore stays platform-agnostic
-// while the host wires in esp_task_wdt_reset() / yield() / etc.
-inline void (*&yield_hook())() {
-	static void (*g_yield_hook)() = nullptr;
-	return g_yield_hook;
-}
-inline void set_yield_callback(void (*cb)()) {
-	yield_hook() = cb;
-}
-inline void yield_now() {
-	auto h = yield_hook();
-	if (h) h();
-}
 // return current time in seconds since startup
 inline static uint32_t time() {
 	// handle roll-over of 32-bit millis (approx. 49 days)

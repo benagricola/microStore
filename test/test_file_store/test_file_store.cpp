@@ -669,6 +669,85 @@ void test_file_store_compact_basic() {
     TEST_ASSERT_EQUAL(0, memcmp(buf, "v3", 2));
 }
 
+// A reset mid-compaction must recover cleanly: the boot must rebuild the index
+// from the actual on-disk segments, NOT a stale pre-compaction index file that
+// points at offsets the compaction has already moved/deleted. (Regression test
+// for the incremental-compaction crash that read garbage on warm-load.)
+void test_file_store_recover_partial_compaction() {
+    reset_ram_fs();
+    const int STABLE = 5;   // written once, live in seg0 — these get MOVED by compaction
+    const int CHURN  = 20;  // overwritten every round to accrue dead records
+    int last_round = 0;
+    {
+        microStore::FileStore w;
+        auto fs = make_ram_fs();
+        w.init(fs, "/rp", /*clear=*/false, /*seg_size=*/1024, /*seg_count=*/8);
+        w.set_incremental(true);
+
+        char k[16], v[24];
+        // A few churny records FIRST — these become dead — so the stable records
+        // that follow sit at a NON-ZERO seg0 offset. Compaction repacks the live
+        // (stable) records to the front of compact.tmp, giving them a NEW offset
+        // that differs from the stale index's old seg0 offset. That mismatch is
+        // exactly what a naive recovery (trusting the stale index) reads wrong.
+        for (int i = 0; i < 3; i++) {
+            snprintf(k, sizeof(k), "c%02d", i);
+            snprintf(v, sizeof(v), "c%02d_000", i);
+            w.put(k, v, /*ttl=*/0, 1);
+        }
+        for (int i = 0; i < STABLE; i++) {
+            snprintf(k, sizeof(k), "s%02d", i);
+            snprintf(v, sizeof(v), "sval%02d", i);
+            w.put(k, v, /*ttl=*/0, 1);
+        }
+        int round = 1;
+        for (; round < 60 && !w.compacting(); round++) {
+            for (int i = 0; i < CHURN; i++) {
+                snprintf(k, sizeof(k), "c%02d", i);
+                snprintf(v, sizeof(v), "c%02d_%03d", i, round);
+                w.put(k, v, /*ttl=*/0, (uint32_t)(1 + round));
+            }
+        }
+        last_round = round - 1;
+        TEST_ASSERT_TRUE_MESSAGE(w.compacting(), "incremental compaction did not begin");
+
+        // Advance until seg0 (5 stable live records) is fully copied + committed,
+        // but stop before the whole compaction finishes — leaving the journal in
+        // COMPACTING (next_seg>0), the stable records moved into compact.tmp, and
+        // seg0 deleted. Then destruct, simulating a reset.
+        for (int s = 0; s < 4 && w.compacting(); s++) w.compact_step(2);
+        TEST_ASSERT_TRUE_MESSAGE(w.compacting(), "compaction finished too soon to test recovery");
+    }
+
+    // Reboot on the same filesystem → recover_if_needed runs at init.
+    microStore::FileStore r;
+    auto fs = make_ram_fs();
+    r.init(fs, "/rp", /*clear=*/false, /*seg_size=*/1024, /*seg_count=*/8);
+
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)(STABLE + CHURN), r.size());
+    // Stable keys — the ones whose record moved out of the deleted seg0.
+    for (int i = 0; i < STABLE; i++) {
+        char k[16], expect[24];
+        snprintf(k, sizeof(k), "s%02d", i);
+        snprintf(expect, sizeof(expect), "sval%02d", i);
+        uint8_t buf[32]; uint16_t sz = sizeof(buf);
+        TEST_ASSERT_TRUE_MESSAGE(r.get(k, buf, &sz), "moved stable key missing after recovery");
+        TEST_ASSERT_EQUAL_UINT32((uint32_t)strlen(expect), sz);
+        TEST_ASSERT_EQUAL_MESSAGE(0, memcmp(buf, expect, sz), "stale-index: wrong stable value after recovery");
+    }
+    // Churny keys must still be present and readable (their exact round isn't
+    // asserted: a raw FileStore — unlike a TieredStore — drops put()s issued
+    // after compact_begin closes the active segment, so the final round's churny
+    // writes don't all land; that's a test-harness artifact, not a recovery bug).
+    (void)last_round;
+    for (int i = 0; i < CHURN; i++) {
+        char k[16]; snprintf(k, sizeof(k), "c%02d", i);
+        uint8_t buf[32]; uint16_t sz = sizeof(buf);
+        TEST_ASSERT_TRUE_MESSAGE(r.get(k, buf, &sz), "churny key missing after recovery");
+        TEST_ASSERT_TRUE_MESSAGE(sz > 0, "churny value empty after recovery");
+    }
+}
+
 /* ---- Main ---- */
 
 void setUp()    {}
@@ -697,5 +776,6 @@ int main() {
     // Additional edge-case tests
     RUN_TEST(test_file_store_ttl_exists_expires);
     RUN_TEST(test_file_store_compact_basic);
+    RUN_TEST(test_file_store_recover_partial_compaction);
     return UNITY_END();
 }
