@@ -80,6 +80,14 @@ public:
         _persist_enabled = persist_enabled;
         if (!_persist_enabled) return true;
 
+        // Re-apply any eviction policy set before init(): set_max_recs/set_ttl_secs
+        // are commonly called at construction (before the persist tier exists), so
+        // they only reached the front. Apply them to the persist tier BEFORE its
+        // init() so the boot-time prune bounds it too — otherwise the front caps
+        // but the flash tier grows unbounded.
+        _persist.set_max_recs(_policy_max_recs);
+        _persist.set_ttl_secs(_policy_ttl);
+
         if (!_persist.init(filesystem, prefix, clearOnInit, segment_size, segment_count)) {
             _persist_enabled = false;   // degrade to front-only
             return true;
@@ -192,8 +200,10 @@ public:
     // Diagnostic dump — only the persist tier has an on-disk layout to describe.
     void dumpInfo(bool detailed = true) { if (_persist_enabled) _persist.dumpInfo(detailed); }
 
-    inline void set_ttl_secs(uint32_t ttl_s)  { _front.set_ttl_secs(ttl_s);  if (_persist_enabled) _persist.set_ttl_secs(ttl_s); }
-    inline void set_max_recs(uint32_t max_recs){ _front.set_max_recs(max_recs);if (_persist_enabled) _persist.set_max_recs(max_recs); }
+    // The policy is remembered so init() can apply it to the persist tier even
+    // when it was set before that tier was brought up (the usual case).
+    inline void set_ttl_secs(uint32_t ttl_s)  { _policy_ttl = ttl_s; _front.set_ttl_secs(ttl_s);  if (_persist_enabled) _persist.set_ttl_secs(ttl_s); }
+    inline void set_max_recs(uint32_t max_recs){ _policy_max_recs = max_recs; _front.set_max_recs(max_recs); if (_persist_enabled) _persist.set_max_recs(max_recs); }
 
     /* -------- ITERATION (delegated to the front) -------- */
 
@@ -301,6 +311,8 @@ private:
     HeapStoreT _front;
     FileStoreT _persist;
     bool       _persist_enabled = false;
+    uint32_t   _policy_max_recs = 0;   // remembered so init() applies it to the persist tier
+    uint32_t   _policy_ttl      = 0;
     std::vector<PendingOp, rebind_alloc_<PendingOp>> _pending;
 };
 

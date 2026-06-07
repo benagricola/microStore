@@ -363,6 +363,34 @@ void test_tiered_front_only_no_persist() {
     TEST_ASSERT_EQUAL_UINT32(0u, reboot.size());   // front-only: cold after reboot
 }
 
+// max_recs set BEFORE init() (the usual case — callers configure the cap at
+// construction, before the persist tier exists) must still bound the persist
+// tier, not just the front. Regression for the path-store bug where the front
+// capped at 500 but the flash tier grew unbounded.
+void test_tiered_max_recs_bounds_persist() {
+    reset_ram_fs();
+    const uint32_t CAP = 20;
+
+    microStore::TieredStore store(2048, 4);
+    store.set_max_recs(CAP);                 // BEFORE init
+    auto fs = make_ram_fs();
+    TEST_ASSERT_TRUE(store.init(fs, "/p", /*persist=*/true, /*clear=*/true));
+
+    for (int i = 0; i < 100; i++) store.put(K(i), V(i, 0));
+    while (store.compacting()) store.compact_step();
+
+    auto s = store.stats();
+    TEST_ASSERT_TRUE_MESSAGE(s.live_recs    <= CAP, "front exceeded max_recs");
+    TEST_ASSERT_TRUE_MESSAGE(s.persist_recs <= CAP, "persist tier exceeded max_recs");
+
+    // And the bound holds across a reboot (the boot-time prune also sees it).
+    microStore::TieredStore reboot(2048, 4);
+    reboot.set_max_recs(CAP);
+    auto fs2 = make_ram_fs();
+    TEST_ASSERT_TRUE(reboot.init(fs2, "/p", /*persist=*/true, /*clear=*/false));
+    TEST_ASSERT_TRUE_MESSAGE(reboot.stats().persist_recs <= CAP, "persist tier exceeded max_recs after reboot");
+}
+
 /* ---- Main ---- */
 
 void setUp()    {}
@@ -374,5 +402,6 @@ int main() {
     RUN_TEST(test_tiered_buffer_during_compaction);
     RUN_TEST(test_tiered_remove_during_compaction);
     RUN_TEST(test_tiered_front_only_no_persist);
+    RUN_TEST(test_tiered_max_recs_bounds_persist);
     return UNITY_END();
 }
