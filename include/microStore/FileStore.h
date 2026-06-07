@@ -305,6 +305,8 @@ USTORE_LOG("[ustore] put: key %s offset %u\n", bin_str(key, key_len), offset);
 
 		current_offset += sizeof(hdr)+key_len+len+sizeof(c);
 
+		_stat_puts++;
+		_stat_bytes += len;
 		compact_if_threshold();
 
 USTORE_LOG("[ustore] put: wrote key %s with data length %u\n", bin_str(key, key_len), len);
@@ -510,6 +512,7 @@ USTORE_LOG("[ustore] get: returning key %s with data length %u\n", bin_str(key, 
 
 		current_offset += sizeof(RecordHeader) + key_len + sizeof(RecordCommit);
 
+		_stat_removes++;
 		compact_if_threshold();
 
 		return true;
@@ -553,6 +556,30 @@ USTORE_LOG("[ustore] get: returning key %s with data length %u\n", bin_str(key, 
 	{
         if (!isValid()) return 0;
 		return _index.size();
+	}
+
+	/* -------- STATS (diagnostics) -------- */
+
+	// Lifetime counters since boot, for write-rate / compaction-frequency
+	// diagnostics. Cheap; not persisted.
+	struct Stats {
+		uint32_t puts;            // successful put() calls
+		uint32_t removes;         // successful remove() calls
+		uint32_t compacts;        // completed compactions
+		uint64_t bytes_written;   // payload bytes appended by put()
+		uint32_t live_recs;       // current live record count (index size)
+		uint32_t dead_since_compact;  // dead records accrued since last compaction
+	};
+	inline Stats stats()
+	{
+		Stats s;
+		s.puts               = _stat_puts;
+		s.removes            = _stat_removes;
+		s.compacts           = _stat_compacts;
+		s.bytes_written      = _stat_bytes;
+		s.live_recs          = (uint32_t)(isValid() ? _index.size() : 0);
+		s.dead_since_compact = _dead_since_compact;
+		return s;
 	}
 
 	/* -------- POLICY -------- */
@@ -1486,6 +1513,7 @@ USTORE_LOG("[ustore] Closing tmp file: %s\n", tmp_name);
 		clear_journal();
 
 		_dead_since_compact = 0;
+		_stat_compacts++;
 
 		return true;
 	}
@@ -1510,6 +1538,15 @@ private:
 
 	uint32_t policy_ttl_secs = USTORE_DEFAULT_TTL_SECS; // 0 = TTL disabled (seconds)
 	uint32_t policy_max_recs = USTORE_DEFAULT_MAX_RECS; // 0 = max-records disabled
+
+	// Lightweight lifetime counters for diagnostics (write rate / compaction
+	// frequency). Cheap to maintain; read via the stats() accessors. Not
+	// persisted — they reset to 0 on each boot, which is what we want for
+	// rate sampling (delta over a window / since-boot).
+	uint32_t _stat_puts     = 0;   // successful put() calls
+	uint32_t _stat_removes  = 0;   // successful remove() calls
+	uint32_t _stat_compacts = 0;   // completed compactions
+	uint64_t _stat_bytes    = 0;   // payload bytes appended by put()
 
 	uint8_t write_buf[USTORE_WRITE_BUFFER_SIZE];
 	size_t write_buf_pos;

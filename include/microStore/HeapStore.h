@@ -109,6 +109,8 @@ public:
         e.timestamp = ts;
         e.ttl = ttl;
 
+        _stat_puts++;
+        _stat_bytes += len;
         return true;
     }
 
@@ -187,6 +189,7 @@ public:
         if (!isValid()) return false;
         if (key_len > USTORE_MAX_KEY_LEN) return false;
         data_.erase(make_key(key, key_len));
+        _stat_removes++;
         return true;
     }
 
@@ -224,6 +227,30 @@ public:
     inline size_t size() const {
         if (!isValid()) return 0;
         return data_.size();
+    }
+
+    /* -------- STATS (diagnostics) -------- */
+
+    // Mirrors microStore::BasicFileStore::Stats so callers can read either
+    // backing uniformly. compacts/dead_since_compact are always 0 here — the
+    // heap store has no on-flash segments to compact.
+    struct Stats {
+        uint32_t puts;
+        uint32_t removes;
+        uint32_t compacts;
+        uint64_t bytes_written;
+        uint32_t live_recs;
+        uint32_t dead_since_compact;
+    };
+    inline Stats stats() {
+        Stats s;
+        s.puts               = _stat_puts;
+        s.removes            = _stat_removes;
+        s.compacts           = 0;
+        s.bytes_written      = _stat_bytes;
+        s.live_recs          = (uint32_t)(isValid() ? data_.size() : 0);
+        s.dead_since_compact = 0;
+        return s;
     }
 
     /* -------- CLEAR -------- */
@@ -358,6 +385,11 @@ private:
 
     uint32_t policy_ttl_secs    = 0;
     uint32_t policy_max_recs = 0;
+
+    // Lifetime diagnostics counters (parity with BasicFileStore::stats()).
+    uint32_t _stat_puts    = 0;
+    uint32_t _stat_removes = 0;
+    uint64_t _stat_bytes   = 0;
 };
 
 using HeapStore = BasicHeapStore<>;
