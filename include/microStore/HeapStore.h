@@ -151,7 +151,7 @@ public:
             }
         }
 
-        const std::vector<uint8_t>& v = it->second.value;
+        const auto& v = it->second.value;
 
         if (out != nullptr) {
             uint16_t n = (uint16_t)std::min((size_t)*size, v.size());
@@ -295,7 +295,12 @@ private:
     using KeyType         = std::vector<uint8_t, byte_alloc_type>;
 
     struct HeapEntry {
-        std::vector<uint8_t> value;
+        // Stored values use the template Allocator (rebound to uint8_t), NOT the
+        // default std::allocator. With ContainerAllocator this routes every value
+        // to PSRAM regardless of size — values under HEAP_EXTMEM_THRESHOLD (256B)
+        // would otherwise land in scarce internal SRAM. 500 known-dest entries at
+        // ~128B each is ~64 KB, enough to starve the WiFi/BT internal-SRAM floor.
+        std::vector<uint8_t, byte_alloc_type> value;
         uint32_t timestamp = 0;
         uint32_t ttl = 0;
     };
@@ -363,7 +368,7 @@ public:
         void load() {
             if (pos_ == end_) return;
             current_.key.assign(pos_->first.begin(), pos_->first.end());
-            current_.value     = pos_->second.value;
+            current_.value.assign(pos_->second.value.begin(), pos_->second.value.end());
             current_.timestamp = pos_->second.timestamp;
             current_.ttl       = pos_->second.ttl;
         }

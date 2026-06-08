@@ -1702,7 +1702,11 @@ private:
 	uint32_t _compact_committed   = 0;   // source segments committed to compact.tmp so far
 	bool     _compact_failed      = false;
 	bool     _compact_dirty       = false; // a record was skipped — finalize must re-scan, not trust the inline index
-	std::vector<uint32_t> _compact_offsets;  // live offsets of the current source segment
+	// PSRAM-backed (rebind to the store's allocator): one segment's live offsets
+	// can be hundreds of uint32_t mid-compaction, and the host runs internal SRAM
+	// tight — keep this off it. ContainerAllocator is stateless, so default
+	// construction routes to PSRAM without referencing _alloc (init-order safe).
+	std::vector<uint32_t, rebind_alloc<uint32_t>> _compact_offsets;  // live offsets of the current source segment
 
 	uint32_t policy_ttl_secs = USTORE_DEFAULT_TTL_SECS; // 0 = TTL disabled (seconds)
 	uint32_t policy_max_recs = USTORE_DEFAULT_MAX_RECS; // 0 = max-records disabled
